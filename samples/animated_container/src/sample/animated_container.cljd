@@ -1,0 +1,37 @@
+(ns sample.animated-container
+  "Faithful port of https://docs.flutter.dev/cookbook/animation/animated-container"
+  (:require
+   ["package:flutter/material.dart" :as m]
+   [cljd.flutter.alpha2 :as f]))
+
+(defn random-color []
+  (m/Color.fromRGBO (rand-int 256)
+                    (rand-int 256)
+                    (rand-int 256)
+                    1))
+
+(defn animated-container []
+  (let [config (atom {:width 50.0 :height 50.0 :color m/Colors.green :border-radius (m/BorderRadius.circular 8.0)})]
+    (m/Scaffold
+     .appBar (m/AppBar .title (m/Text "AnimatedContainer Demo"))
+     .body
+     (m/Center
+      .child
+      (f/widget
+       :watch [{:keys [width height color border-radius]} config]
+       (m/AnimatedContainer
+        .width width
+        .height height
+        .decoration (m/BoxDecoration .color color .borderRadius border-radius)
+        .duration (Duration .seconds 1)
+        .curve m/Curves.fastOutSlowIn)))
+     .floatingActionButton
+     (m/FloatingActionButton .onPressed
+       #(swap! config assoc
+          :width (rand-int 300)
+          :height (rand-int 300)
+          :color (random-color)
+          :border-radius (m/BorderRadius.circular (rand-int 100)))
+       .child (m/Icon. m/Icons.play_arrow)))))
+
+(defn main [] (m/runApp (m/MaterialApp .home (animated-container))))

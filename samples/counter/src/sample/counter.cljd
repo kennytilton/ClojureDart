@@ -2,30 +2,30 @@
   "The perennial counter demo."
   (:require
    ["package:flutter/material.dart" :as m]
-   [cljd.flutter.alpha :as f]))
+   [cljd.flutter.alpha2 :as f]))
 
 (defn main []
-  (m/runApp
-    (m/MaterialApp
-      :title "Cljd Demo"
-      :theme (m/ThemeData :primarySwatch m.Colors/blue)
-      :home
+  (let [counter (atom 0)]
+    (m/runApp
       (f/widget
-        :state [counter 0]
-        :context ctx
+        (m/MaterialApp
+          .title "Cljd Demo"
+          .theme (m/ThemeData .primarySwatch m/Colors.blue))
+        .home
         (m/Scaffold
-          :appBar (m/AppBar :title (m/Text "ClojureDart Home Page"))
-          :body
-          (f/nest
-            m/Center
-            (m/Column
-              :mainAxisAlignment m.MainAxisAlignment/center
-              :children
-              [(m/Text "You have pushed the button this many times:")
-               (m/Text (str @counter)
-                 :style (-> ctx m.Theme/of .textTheme .displayLarge))]))
-          :floatingActionButton
-          (m/FloatingActionButton
-            :onPressed #(swap! counter inc)
-            :tooltip "Increment"
-            :child (m/Icon m.Icons/add)))))))
+          .appBar (m/AppBar .title (m/Text "ClojureDart Home Page"))
+          .floatingActionButton
+          (f/widget
+            (m/FloatingActionButton
+              .onPressed #(swap! counter inc)
+              .tooltip "Increment")
+            (m/Icon m/Icons.add)))
+        .body
+        m/Center
+        (m/Column .mainAxisAlignment m/MainAxisAlignment.center)
+        .children
+        [(m/Text "You have pushed the button this many times:")
+         (f/widget
+           :get {{{:flds [displayLarge]} .-textTheme} m/Theme}
+           :watch [N counter]
+           (m/Text (str N) .style displayLarge))]))))

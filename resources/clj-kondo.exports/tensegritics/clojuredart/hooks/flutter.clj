@@ -14,19 +14,42 @@
                     binding)))
         (partition 2 (:children with-node))))
 
+(defn- ^:macro-support camel-kebab [s]
+  (str/replace s #"(^[A-Z])|[A-Z]" 
+               (fn [[s start]] (cond->> (str/lower-case s) (not start) (str "-")))))
+
 (defn- bind-identity 
   "Returns node-binding like [symbol identity] or nil"
   [symb]
   (when symb [(token-node symb) (api/token-node 'identity)]))
 
+(defn- inherit->bindings [form]
+  (cond 
+    ;; {:of [:a/b m/Theme]} -> [:a/b m/Theme] 
+    (:of form)
+    (inherit->bindings (:of form))
+
+
+    ;; [:a/b m/Theme] -> {b :a/b, theme m/Theme}
+    (vector? form)
+    (->> form
+         (map (fn [e]
+                (if (keyword? e)
+                  [(symbol (name e)) e] ;; using name to get rid of prefix: a.b/c -> c
+                  [(symbol (camel-kebab (-> e name))) e])))
+         (into {})
+         inherit->bindings)
+
+    :else (->> form keys (mapcat bind-identity))))
+
 (defn- with->binding+dispose 
-  "Returns seq with sequences like ([name value :duspose form] ...)"
+  "Returns seq with sequences like ([name value :dispose form] ...)"
   [with]
   (filter #(-> % (nth 2) (= :dispose)) (partition 4 1 (list* nil nil with))))
 
 (defn- find! [condition node msg]
   (when condition 
-    (api/reg-finding! (assoc (meta node) :message msg :type :cljd/widget))))
+    (api/reg-finding! (assoc (meta node) :message msg :type :flutter/widget))))
 
 (defn widget 
   "Hook for cljd.flutter.alpha/widget macro"
@@ -36,7 +59,7 @@
         pairs->value (fn [k] (first (filter #(-> % first (api/sexpr) (= k)) opts-nodes)))
         [_ with-node] (pairs->value :with)
 
-        {:keys [state context ticker tickers watch key with] :as opts} 
+        {:keys [state context ticker tickers watch key with bind nested-in inherit] :as opts} 
         (into {} (map (fn [[k v]] (vector (sexpr k) (sexpr v)))) opts-nodes)
 
         bindings-count (* 2 (count opts-nodes))
@@ -44,7 +67,10 @@
 
         unknown-keys (set/difference 
                        (into #{} (keys opts))
-                       #{:state :key :watch :context :with :ticker :tickers})]
+                       #{:state :key :watch :context :with :ticker 
+                         :tickers :bind :nested-in :inherit})]
+
+    (prn :inherit (inherit->bindings inherit))
 
     (find! (not= (count opts-nodes) (count (keys opts)))
            node
@@ -59,13 +85,24 @@
            (first args)
            (str "Unknown first form " (api/sexpr (first args))))
 
+    (find! (and bind 
+                (or (not (map? bind))
+                    (some #(-> % keyword? not) (keys bind))))
+           (first (pairs->value :bind))
+           ":bind should be a map with toplevel keys as clojure keywords")
+
+    (find! (and nested-in 
+                (or (not (vector? nested-in)) (empty? nested-in)))
+           (first (pairs->value :nested-in))
+           ":nested-in should be a vector of widgets with :child binding omitted")
+
     (find! (and state watch)
            (first (pairs->value :state))
            ":state and :watch option keys are mutually exclusive")
 
     (find! (and with 
                 (or (not (vector? with))
-                    (some #(not (or (symbol? %) (keyword? %))) (take-nth 2 with))))
+                    (some #(not (or (symbol? %) (= :let %) (= :dispose %))) (take-nth 2 with))))
            with-node 
            ":with left hand simbols should be simple simbols, :let, or :dispose")
 
@@ -98,10 +135,12 @@
                    (concat (bind-identity context) 
                            (bind-identity ticker)
                            (bind-identity tickers)
-                           (when (vector? state) ;; TODO when   
-                             [(token-node (first state))
+                           (when (vector? state)  
+                             [(with-meta (token-node (first state)) 
+                                         (meta (-> :state pairs->value second :children first)))
                               (list-node [(token-node 'atom) (token-node (second state))])])
-                           (with->bindings with-node)))
+                           (with->bindings with-node)
+                           (inherit->bindings inherit)))
                  (when watch (with-meta (token-node watch) (meta (second (pairs->value :watch)))))
                  (when key (with-meta (token-node key) (meta (second (pairs->value :key)))))
                  body))}))

@@ -9,7 +9,8 @@
 (ns cljd.core
   (:require ["dart:math" :as math]
             ["dart:collection" :as dart-coll]
-            ["dart:io" :as dart-io]))
+            ["dart:io" :as dart-io]
+            ["dart:async" :as dart-async]))
 
 (def ^:private sentinel (Object.))
 
@@ -24,15 +25,18 @@
       (loop [params params
              new-params (with-meta [] (meta params))
              lets []]
-        (if params
-          (if (symbol? (first params))
-            (recur (next params) (conj new-params (first params)) lets)
-            (let [gparam (gensym "p__")]
-              (recur (next params) (conj new-params gparam)
-                (-> lets (conj (first params)) (conj gparam)))))
+        (cond
+          (not params)
           `(~new-params
             (let ~lets
-              ~@body)))))))
+              ~@body))
+          (not (symbol? (first params)))
+          (let [gparam (gensym "p__")]
+            (recur (next params) (conj new-params gparam)
+              (-> lets (conj (first params)) (conj gparam))))
+          (contains? '#{... .&} (first params))
+          `([~@(concat new-params params)] (let ~lets ~@body))
+          :else (recur (next params) (conj new-params (first params)) lets))))))
 
 (def ^{:macro true
        :doc
@@ -258,73 +262,83 @@
                          (if (seq bs)
                            (let [firstb (first bs)]
                              (cond
-                              (= firstb '&) (recur (pb ret (second bs) gseq)
-                                                   n
-                                                   (nnext bs)
-                                                   true)
-                              (= firstb :as) (pb ret (second bs) gvec)
-                              :else (if seen-rest?
-                                      (throw (new Exception "Unsupported binding form, only :as can follow & parameter"))
-                                      (recur (pb (if has-rest
-                                                   (conj ret
-                                                         gfirst `(first ~gseq)
-                                                         gseq `(next ~gseq))
-                                                   ret)
-                                                 firstb
-                                                 (if has-rest
-                                                   gfirst
-                                                   (list `nth gvec n nil)))
-                                             (inc n)
-                                             (next bs)
-                                             seen-rest?))))
+                               (= firstb '&) (recur (pb ret (second bs) gseq)
+                                                    n
+                                                    (nnext bs)
+                                                    true)
+                               (= firstb :as) (pb ret (second bs) gvec)
+                               :else (if seen-rest?
+                                       (throw (new Exception "Unsupported binding form, only :as can follow & parameter"))
+                                       (recur (pb (if has-rest
+                                                    (conj ret
+                                                          gfirst `(first ~gseq)
+                                                          gseq `(next ~gseq))
+                                                    ret)
+                                                  firstb
+                                                  (if has-rest
+                                                    gfirst
+                                                    (list `nth gvec n nil)))
+                                              (inc n)
+                                              (next bs)
+                                              seen-rest?))))
                            ret))))
                    pmap
                    (fn [bvec b v]
-                     (let [gmap (gensym "map__")
-                           defaults (:or b)]
-                       (loop [ret (-> bvec (conj gmap) (conj v)
-                                      (conj gmap) (conj `(if (seq? ~gmap) (-map-lit (seq ~gmap)) ~gmap))
-                                      ((fn [ret]
-                                         (if (:as b)
-                                           (conj ret (:as b) gmap)
-                                           ret))))
+                     (let [gmap (vary-meta (or (:as b) (gensym "map__"))
+                                  merge (meta b))
+                           defaults (:or b)
+                           obj-mode
+                           (some (fn [[k v]]
+                                   (or (and (keyword? k) (= "flds" (name k)))
+                                       (and (simple-symbol? v)
+                                            (.startsWith (name v) ".-")))) b)]
+                       (loop [ret (cond-> (-> bvec (conj gmap) (conj v))
+                                    (not obj-mode)
+                                    (->
+                                     (conj gmap)
+                                     (conj `(if (seq? ~gmap) (-map-lit (seq ~gmap)) ~gmap))))
                               bes (let [transforms
-                                          (reduce
-                                            (fn [transforms mk]
-                                              (if (keyword? mk)
-                                                (let [mkns (namespace mk)
-                                                      mkn (name mk)]
-                                                  (cond (= mkn "keys") (assoc transforms mk #(keyword (or mkns (namespace %)) (name %)))
-                                                        (= mkn "syms") (assoc transforms mk #(list `quote (symbol (or mkns (namespace %)) (name %))))
-                                                        (= mkn "strs") (assoc transforms mk str)
-                                                        :else transforms))
-                                                transforms))
-                                            {}
-                                            (keys b))]
+                                        (reduce
+                                         (fn [transforms mk]
+                                           (if (keyword? mk)
+                                             (let [mkns (namespace mk)
+                                                   mkn (name mk)]
+                                               (cond (= mkn "keys") (assoc transforms mk #(keyword (or mkns (namespace %)) (name %)))
+                                                     (= mkn "syms") (assoc transforms mk #(list `quote (symbol (or mkns (namespace %)) (name %))))
+                                                     (= mkn "strs") (assoc transforms mk str)
+                                                     (= mkn "flds") (assoc transforms mk #(symbol (str ".-" (name %))))
+                                                     :else transforms))
+                                             transforms))
+                                         {}
+                                         (keys b))]
                                     (reduce
-                                        (fn [bes entry]
-                                          (reduce #(assoc %1 %2 ((val entry) %2))
-                                                   (dissoc bes (key entry))
-                                                   ((key entry) bes)))
-                                        (dissoc b :as :or)
-                                        transforms))]
+                                     (fn [bes entry]
+                                       (reduce #(assoc %1 %2 ((val entry) %2))
+                                               (dissoc bes (key entry))
+                                               ((key entry) bes)))
+                                     (dissoc b :as :or)
+                                     transforms))]
                          (if (seq bes)
                            (let [bb (key (first bes))
                                  bk (val (first bes))
                                  local (if (ident? bb) (with-meta (symbol nil (name bb)) (meta bb)) bb)
-                                 bv (if (contains? defaults local)
+                                 bv (cond
+                                      (and (simple-symbol? bk)
+                                           (.startsWith (name bk) ".-")) ; field
+                                      (list bk gmap)
+                                      (contains? defaults local)
                                       (list `get gmap bk (defaults local))
-                                      (list `get gmap bk))]
+                                      :else (list `get gmap bk))]
                              (recur (if (ident? bb)
                                       (-> ret (conj local bv))
                                       (pb ret bb bv))
                                     (next bes)))
                            ret))))]
                (cond
-                (symbol? b) (-> bvec (conj b) (conj v))
-                (vector? b) (pvec bvec b v)
-                (map? b) (pmap bvec b v)
-                :else (throw (new Exception (str "Unsupported binding form: " b))))))
+                 (symbol? b) (-> bvec (conj b) (conj v))
+                 (vector? b) (pvec bvec b v)
+                 (map? b) (pmap bvec b v)
+                 :else (throw (new Exception (str "Unsupported binding form: " b))))))
         process-entry (fn [bvec b] (pb bvec (first b) (second b)))]
     (if (every? symbol? (map first bents))
       bindings
@@ -366,14 +380,22 @@
 
 (defmacro deftype [& args]
   (let [[class-name fields & args] args
-        [opts specs] (roll-leading-opts args)]
-    `(do
-       (~'deftype* ~class-name ~fields ~opts ~@specs)
-       ~(when-not (or (:type-only opts) (:abstract (meta class-name)))
-          `(defn
-             ~(symbol (str "->" class-name))
-             [~@fields]
-             (new ~(vary-meta class-name dissoc :type-params) ~@fields))))))
+        [opts specs] (roll-leading-opts args)
+        specs (map (fn [form]
+                     (if (symbol? form)
+                       form
+                       (let [[n p & body] form]
+                         (cons n (maybe-destructured p body)))))
+                specs)
+        deftype-form (list* 'deftype* class-name fields opts specs)]
+    (if (or (:type-only opts) (:abstract (meta class-name)))
+      deftype-form
+      `(do
+         ~deftype-form
+         (defn
+           ~(symbol (str "->" class-name))
+           [~@fields]
+           (new ~(vary-meta class-name dissoc :type-params) ~@fields))))))
 
 (defmacro definterface [iface & meths]
   `(deftype ~(vary-meta iface assoc :abstract true) []
@@ -423,7 +445,7 @@
   [& names] `(do ~@(map #(list 'def % nil) names)))
 
 (defn ^bool satisfies?
-  {:inline (fn [protocol x] `(.satisfies ~protocol ~x))
+  {:inline (fn [protocol x] `(.satisfies ~(vary-meta protocol assoc :tag `IProtocol) ~x))
    :inline-arities #{2}}
   [^IProtocol protocol x]
   (.satisfies protocol x))
@@ -453,6 +475,11 @@
   (if (or (nil? x) (false? x))
     false
     true))
+
+(defn ^bool boolean?
+  "Return true if x is a Boolean"
+  [x]
+  (dart/is? x bool))
 
 (defn ^bool some?
   "Returns true if x is not nil, false otherwise."
@@ -834,6 +861,9 @@
       (-print o sb)
       (.toString sb))))
 
+(defn ^:macro-support ^:private call-to [f]
+  (fn [& args] (cons f args)))
+
 (defprotocol INamed
   "Protocol for adding a name."
   (-name [x]
@@ -848,7 +878,7 @@
 
 (defn ^String? namespace
   "Returns the namespace String of a symbol or keyword, or nil if not present."
-  {:inline (fn [x] `(-namespace ~x))
+  {:inline (call-to `-namespace)
    :inline-arities #{1}}
   [x]
   (-namespace x))
@@ -870,7 +900,7 @@
     that implement Iterable. Note that seqs cache values, thus seq
     should not be used on any Iterable whose iterator repeatedly
     returns the same mutable object."
-  {:inline (fn [coll] `(-seq ~coll))
+  {:inline (call-to `-seq)
    :inline-arities #{1}}
   [coll] (-seq coll))
 
@@ -896,11 +926,20 @@
 
 (extend-type Null
   ISeqable
-  (-seq [coll] nil)
+  (-seq [coll] nil))
+
+(extend-type fallback
   ISeq
-  (-first [coll] nil)
-  (-rest [coll] ())
-  (-next [coll] nil))
+  (-first [coll]
+    (when-not (nil? coll)
+      (throw (ArgumentError. (str "Don't know how to create ISeq from: " coll)))))
+  (-rest [coll]
+    (if-not (nil? coll)
+      (throw (ArgumentError. (str "Don't know how to create ISeq from: " coll)))
+      ()))
+  (-next [coll]
+    (when-not (nil? coll)
+      (throw (ArgumentError. (str "Don't know how to create ISeq from: " coll))))))
 
 (defn first
   "Returns the first item in the collection. Calls seq on its
@@ -933,7 +972,7 @@
 (defn ^bool realized?
   "Returns true if a value has been produced for a promise, delay, future or lazy sequence."
   {:inline-arities #{1}
-   :inline (fn [x] `(-realized? ~x))}
+   :inline (call-to `-realized?)}
   [x]
   (-realized? x))
 
@@ -946,7 +985,7 @@
 (defn ^bool realized?
   "Returns true if a value has been produced for a promise, delay, future or lazy sequence."
   {:inline-arities #{1}
-   :inline (fn [x] `(-realized? ~x))}
+   :inline (call-to `-realized?)}
   [x]
   (-realized? x))
 
@@ -1113,7 +1152,7 @@
     (reduce (fn [n _] (inc n)) 0 coll)))
 
 (defn ^int count
-  {:inline (fn [coll] `(-count ~coll))
+  {:inline (call-to `-count)
    :inline-arities #{1}}
   [coll]
   (-count coll))
@@ -1186,7 +1225,7 @@
   [x] (satisfies? IAssociative x))
 
 (defn assoc
-  {:inline (fn [map key val] `(-assoc ~map ~key ~val))
+  {:inline (call-to `-assoc)
    :inline-arities #{3}}
   ([map key val] (-assoc map key val))
   ([map key val & kvs]
@@ -1513,7 +1552,7 @@
   (-meta [_] nil))
 
 (defn meta
-  {:inline (fn [obj] `(-meta ~obj))
+  {:inline (call-to `-meta)
    :inline-arities #{1}}
   [obj]
   (-meta obj))
@@ -1638,6 +1677,10 @@
     (get coll kw))
   (-invoke [kw coll not-found]
     (get coll kw not-found))
+  (-apply [kw more]
+    (case (bounded-count 3 more)
+      1 (get (first more) kw)
+      2 (get (first more) kw (second more))))
   IHash
   (-hash [this] _hash)
   INamed
@@ -1724,6 +1767,10 @@
     (get coll s))
   (-invoke [s coll not-found]
     (get coll s not-found))
+  (-apply [s more]
+    (case (bounded-count 3 more)
+      1 (get (first more) s)
+      2 (get (first more) s (second more))))
   IEquiv
   (-equiv [this other]
     (and (dart/is? other Symbol)
@@ -1965,14 +2012,14 @@
   IReset
   (-reset! [this new-value] (set-and-validate-atom-state! this new-value)))
 
-(defn reset! [^Atom atom new-value]
+(defn reset! [atom new-value]
   (-reset! atom new-value))
 
 (defn ^bool compare-and-set!
   "Atomically sets the value of atom to newval if and only if the
   current value of the atom is equal to oldval. Returns true if
   set happened, else false."
-  [^Atom a oldval newval]
+  [a oldval newval]
   (if (= (-deref a) oldval)
     (do (reset! a newval) true)
     false))
@@ -2026,7 +2073,7 @@
   [^Atom atom f & args]
   (set! (.-meta atom) (apply f (.-meta atom) args)))
 
-(defn ^Atom add-watch
+(defn add-watch
   "Adds a watch function to an atom reference. The watch fn must be a
   fn of 4 args: a key, the reference, its old-state, its
   new-state. Whenever the reference's state might have been changed,
@@ -2045,32 +2092,33 @@
       ;; Assertion Error
       (deref a)
       ;=> 1"
-  [^Atom reference key fn]
-  (-add-watch reference key fn)
-  reference)
+  {:inline (fn [r k f] `(doto ~r (-add-watch ~k ~f)))
+   :inline-arities #{3}}
+  [reference key fn]
+  (doto reference (-add-watch key fn)))
 
-(defn ^Atom remove-watch
+(defn remove-watch
   "Removes a watch (set by add-watch) from a reference"
-  [^Atom reference key]
-  (-remove-watch reference key)
-  reference)
+  {:inline (fn [r k] `(doto ~r (-remove-watch ~k)))
+   :inline-arities #{2}}
+  [reference key]
+  (doto reference (-remove-watch key)))
 
 (defn swap!
   "Atomically swaps the value of atom to be:
   (apply f current-value-of-atom args). Note that f may be called
   multiple times, and thus should be free of side effects.  Returns
   the value that was swapped in."
-  ([^Atom a f] (-swap! a f))
-  ([^Atom a f x] (-swap! a f x))
-  ([^Atom a f x y] (-swap! a f x y))
-  ([^Atom a f x y & more] (-swap! a f x y more)))
+  ([a f] (-swap! a f))
+  ([a f x] (-swap! a f x))
+  ([a f x y] (-swap! a f x y))
+  ([a f x y & more] (-swap! a f x y more)))
 
 (defn reset-vals!
   "Sets the value of atom to newval. Returns [old new], the value of the
    atom before and after the reset."
-  [^Atom a newval]
-  (let [old-state (.-state a)]
-    [old-state (set-and-validate-atom-state! a newval)]))
+  [a newval]
+  [@a (set-and-validate-atom-state! a newval)])
 
 (defn reset-meta!
   [^Atom iref metadata-map]
@@ -2081,17 +2129,17 @@
   (apply f current-value-of-atom args). Note that f may be called
   multiple times, and thus should be free of side effects.
   Returns [old new], the value of the atom before and after the swap."
-  ([^Atom a f]
-   (let [old-state (.-state a)]
+  ([a f]
+   (let [old-state @a]
      [old-state (swap! a f)]))
-  ([^Atom a f x]
-   (let [old-state (.-state a)]
+  ([a f x]
+   (let [old-state @a]
      [old-state (swap! a f x)]))
-  ([^Atom a f x y]
-   (let [old-state (.-state a)]
+  ([a f x y]
+   (let [old-state @a]
      [old-state (swap! a f x y)]))
-  ([^Atom a f x y & more]
-   (let [old-state (.-state a)]
+  ([a f x y & more]
+   (let [old-state @a]
      [old-state (apply swap! a f x y more)])))
 
 (defprotocol IRecord
@@ -2302,6 +2350,13 @@
   ([^num x ^num y & more]
    (reduce / (/ x y) more)))
 
+(defn ^num abs
+  {:doc "Returns the absolute value of a."
+   :inline-arities #{1}
+   :inline (fn [a] `(.abs ~a))}
+  [^num a]
+  (.abs a))
+
 ;; TODO type hint
 (defn rem
   {:inline (fn [num div] `(.num:remainder ~num ~div))
@@ -2310,7 +2365,7 @@
   (.remainder num div))
 
 (defn ^num quot
-  {:inline (fn [num div] `(. num "num:~/" div))
+  {:inline (fn [num div] `(. ~num "num:~/" ~div))
    :inline-arities #{2}}
   [^num num ^num div]
   (. num "~/" div))
@@ -2508,10 +2563,10 @@
   [^List array] (.-length array))
 
 (defn ^List aclone
-  {:inline (fn [arr] `(.from dart:core/List ~arr .& :growable false))
+  {:inline (fn [arr] `(.from dart:core/List ~arr .growable false))
    :inline-arities #{1}}
   [^List arr]
-  (.from List arr .& :growable false))
+  (.from List arr .growable false))
 
 (defmacro amap
   "Maps an expression across an array a, using an index named idx, and
@@ -2544,7 +2599,7 @@
      ([~'size-or-seq]
       (if (int? ~'size-or-seq)
         (.filled ^{:type-params (~class-name)} List ~'size-or-seq ~default-value)
-        (.from ^{:type-params (~class-name)} List ~'size-or-seq ~'.& :growable false)))
+        (.from ^{:type-params (~class-name)} List ~'size-or-seq .growable false)))
      ([~'size ~'init-val-or-seq]
       (if (seq? ~'init-val-or-seq)
         (let [a# (.filled ^{:type-params (~class-name)} List ~'size ~default-value)]
@@ -3697,7 +3752,7 @@
       (RSeq. nil rev (dec cnt) -1))))
 
 (deftype #/(SubVec E)
-  [meta v ^int start ^int end ^:mutable ^int __hash]
+  [meta ^PersistentVector v ^int start ^int end ^:mutable ^int __hash]
   :type-only true
   ^:mixin EquivSequentialHashMixin
   ^:mixin #/(dart-coll/ListMixin E)
@@ -3712,7 +3767,10 @@
             :else #dart ^:fixed [(key v) (val v)]))
         (. #/(cast E))
         .-iterator)
-      (PVIterator. v start end  (.-tail ^PersistentVector v))))
+      (PVIterator. v start end
+        (if (<= (bit-and-not (dec (.-cnt v)) 31) start)
+          (.-tail v)
+          (unchecked-array-for (.-root v) (.-shift v) start)))))
   ^:mixin #/(SeqListMixin E)
   (^#/(SubVec R) #/(cast R) [coll]
    (new #/(SubVec R) meta v start end __hash))
@@ -4512,7 +4570,7 @@
           (let [^BitmapNode child (aget arr idx)]
             (if (zero? hi)
               ; if node is not owned
-              (let [^BitmapNode child' (.inode_assoc child shift h k v)]
+              (let [^BitmapNode child' (.inode_assoc child (+ shift 5) h k v)]
                 (when-not (identical? child child')
                   (set! bitmap-hi (bit-xor hi bitmap-hi))
                   (set! bitmap-lo (bit-xor hi bitmap-lo))
@@ -4529,7 +4587,7 @@
               ;; TODO not=
               (not (= k' k))
               (let [net-size (dec (u32x2-bit-count bitmap-hi bitmap-lo))
-                    gross-size (inc (bit-or 7 (dec net-size)))
+                    gross-size (bit-and -8 (+ 7 net-size))
                     shift' (+ 5 ^int shift)
                     n' (bit-and (u32-bit-shift-right (hash k') shift') 31)
                     bit' (u32-bit-shift-left 1 n')
@@ -4590,7 +4648,7 @@
                 (let [k (aget (.-arr child') 0)
                       v (aget (.-arr child') 1)
                       net-size (inc (u32x2-bit-count bitmap-hi bitmap-lo))
-                      gross-size (inc (bit-or 7 (dec net-size)))
+                      gross-size (bit-and -8 (+ 7 net-size))
                       from-arr arr]
                   (when (< (.-length arr) net-size)
                     (set! arr (aresize arr idx gross-size nil)))
@@ -4608,7 +4666,7 @@
           ; the right kv pair
           (= k (aget arr idx))
           (let [net-size (- (u32x2-bit-count bitmap-hi bitmap-lo) 2)
-                gross-size (inc (bit-or 7 (dec net-size)))
+                gross-size (bit-and -8 (+ 7 net-size))
                 from-arr arr]
             (when (< gross-size (.-length arr))
               (set! arr (aresize arr idx gross-size nil)))
@@ -4898,7 +4956,7 @@
     (let [bitmap-hi (.-bitmap_hi root)
           bitmap-lo (.-bitmap_lo root)
           net-size (u32x2-bit-count bitmap-hi bitmap-lo)
-          gross-size (inc (bit-or 7 (dec net-size)))]
+          gross-size (bit-and -8 (+ 7 net-size))]
       (TransientHashMap. true (BitmapNode. (.-cnt root) (bit-and bitmap-hi bitmap-lo) (bit-or bitmap-hi bitmap-lo) (aresize (.-arr root) net-size gross-size nil))))))
 
 (def ^PersistentHashMap -EMPTY-MAP
@@ -4932,14 +4990,14 @@
   "Returns a sequence of the map's keys, in the same order as (seq map)."
   [coll]
   (if (dart/is? coll dart:core/Map)
-    (chunked-iterator-seq (.-iterator (.keys ^dart:core/Map coll)))
+    (chunked-iterator-seq (.-iterator (.-keys ^dart:core/Map coll)))
     (seq (map key coll))))
 
 (defn vals
   "Returns a sequence of the map's values, in the same order as (seq map)."
   [coll]
   (if (dart/is? coll dart:core/Map)
-    (chunked-iterator-seq (.-iterator (.values ^dart:core/Map coll)))
+    (chunked-iterator-seq (.-iterator (.-values ^dart:core/Map coll)))
     (seq (map val coll))))
 
 (deftype #/(PersistentHashSet E)
@@ -5046,7 +5104,7 @@
 (defn ^List to-array
   [coll]
   (if (dart/is? coll List)
-    (.toList ^List coll :growable false)
+    (.toList ^List coll .growable false)
     (let [length (count coll)
           ^#/(List dynamic) ary (.filled List length nil)]
       (loop [s (seq coll)
@@ -6489,11 +6547,14 @@
   ([] #{})
   ([& keys] (into #{} keys)))
 
-(defn ^PersistentHashMap -map-lit [^List kvs]
-  (loop [^TransientHashMap tm (-as-transient {}) ^int i 0]
-    (if (< i (.-length kvs))
-      (recur (-assoc! tm (aget kvs i) (aget kvs (+ i 1))) (+ i 2))
-      ^PersistentHashMap (-persistent! tm))))
+(defn ^PersistentHashMap -map-lit [kvs]
+  (if (nil? kvs)
+    {}
+    (let [^List kvs kvs]
+      (loop [^TransientHashMap tm (-as-transient {}) ^int i 0]
+        (if (< i (.-length kvs))
+          (recur (-assoc! tm (aget kvs i) (aget kvs (+ i 1))) (+ i 2))
+          ^PersistentHashMap (-persistent! tm))))))
 
 (defn ^PersistentHashMap hash-map
   "keyval => key val
@@ -6685,11 +6746,11 @@
   java.util.regex.Matcher.matches().  Uses re-groups to return the
   groups."
   [^RegExp re ^String s]
-  (let [re (RegExp. (str "(?:" (.-pattern re) ")$") .&
-             :multiLine (.-isMultiLine re)
-             :caseSensitive (.-isCaseSensitive re)
-             :unicode (.-isUnicode re)
-             :dotAll (.-isDotAll re))]
+  (let [re (RegExp. (str "(?:" (.-pattern re) ")$")
+             .multiLine (.-isMultiLine re)
+             .caseSensitive (.-isCaseSensitive re)
+             .unicode (.-isUnicode re)
+             .dotAll (.-isDotAll re))]
     (when-some [m (.matchAsPrefix re s)]
       (re-groups m))))
 
@@ -6733,7 +6794,7 @@
   [s]
   (if (dart/is? s RegExp)
     s
-    (RegExp. s .& :unicode true)))
+    (RegExp. s .unicode true)))
 
 (defmacro assert
   "Evaluates expr and throws an exception if it does not evaluate to
@@ -7032,10 +7093,10 @@
              (or (identical? ~this ~other)
                (and (dart/is? ~other ~name)
                  ~@(map (fn [field]
-                          `(= ~(list (symbol (str ".-" field)) this)
-                             ~(list (symbol (str ".-" field)) (with-meta other {:tag name})))) fields)
+                          `(= ~field (~(keyword field) ~other) ; TODO direct field access
+                             #_~(list (symbol (str ".-" field)) (with-meta other {:tag name})))) fields)
                  (= ~extmap
-                   (~'.-extmap ~(with-meta other {:tag name})))))))
+                   (.-extmap ~(with-meta other {:tag name})))))))
          'cljd.core/IMap
          `(~'-dissoc [coll# k#]
            (if (contains? #{~@(map keyword fields)} k#)
@@ -7149,3 +7210,97 @@
              nil
              (reduce dissoc (into {} ~m) ~(into [] (map keyword) fields))
              -1)))))
+
+(defmacro extend-protocol [protocol & types+impls]
+  (when-some [[type & more] (seq types+impls)]
+    (let [[impls types+impls] (split-with seq? more)]
+      `(do
+         (extend-type ~type ~protocol ~@impls)
+         (extend-protocol ~protocol ~@types+impls)))))
+
+(defn ^Stream stream
+  "Coerces its last argument to a stream.
+  Currently streams, iterables, seqables and atoms can be coerced to streams.
+  When a transducer is supplied, returns a stream of applications of
+  the transform to the input events.
+  When two transducers are supplied, the first one is applied to events,
+  and the second one is applied to [error nil-or-stack-trace] pairs.
+  The error-mode argument controls whether transformed errors produce errors
+  (:as-errors, the default) or events (:as-values) in the resulting stream.
+  In :as-errors mode, transformed values must be [error nil-or-stack-trace] too.
+  If any transform terminates, the stream is closed."
+  ([x]
+   (cond ; TODO: introduce Streamable protocol
+     (dart/is? x Stream) x
+     (dart/is? x Iterable) (Stream/fromIterable x)
+     (satisfies? x IWatchable)
+     (let [ctrl (dart-async/StreamController.broadcast)
+           cb (fn [k r o n] (.add ctrl n))]
+       (add-watch x cb cb)
+       (.-stream ctrl))
+     :else (Stream/fromIterable (sequence x))))
+  ([xform x]
+   (stream xform identity :as-errors x))
+  ([xform error-xform x]
+   (stream xform error-xform :as-errors x))
+  ([xform error-xform error-mode x]
+   (Stream/eventTransformed
+    (stream x)
+    (fn [^dart-async/EventSink es]
+      (let [add-rf
+            (fn
+              ([] nil)
+              ([acc] nil)
+              ([acc x]
+               (.add es x)
+                ; it's important in case acc is reduced
+               acc))
+            rf (xform add-rf)
+            error-rf
+            (error-xform
+             (case error-mode
+               :as-values add-rf
+               :as-errors
+               (fn
+                 ([] nil)
+                 ([acc] nil)
+                 ([acc [e st]]
+                  (.addError es e st)
+                    ; it's important in case acc is reduced
+                  acc))))]
+        (reify dart-async/EventSink
+          (add [self x] (when (reduced? (rf nil x)) (.close self)))
+          (addError [self e ... st] (when (reduced? (error-rf nil [e st])) (.close self)))
+          (close [_]
+            (rf nil)
+            (error-rf nil)
+            (.close es))))))))
+
+(defn update-vals
+  "m f => {k (f v) ...}
+
+  Given a map m and a function f of 1-argument, returns a new map where the keys of m
+  are mapped to result of applying f to the corresponding values of m."
+  [m f]
+  (with-meta
+    (persistent!
+     (reduce-kv (fn [acc k v] (assoc! acc k (f v)))
+                (if (satisfies? IEditableCollection m)
+                  (transient m)
+                  (transient {}))
+                m))
+    (meta m)))
+
+(defn update-keys
+  "m f => {(f k) v ...}
+
+  Given a map m and a function f of 1-argument, returns a new map whose
+  keys are the result of applying f to the keys of m, mapped to the
+  corresponding values of m.
+  f must return a unique key for each key of m, else the behavior is undefined."
+  [m f]
+  (let [ret (persistent!
+             (reduce-kv (fn [acc k v] (assoc! acc (f k) v))
+                        (transient {})
+                        m))]
+    (with-meta ret (meta m))))

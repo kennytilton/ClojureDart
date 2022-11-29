@@ -10,7 +10,9 @@
 ;;
 
 (ns cljd.test-clojure.core-test-cljd
-  (:require ["dart:async" :as async])
+  (:require ["dart:developer" :as dev]
+            ["dart:io" :as io]
+            [cljd.string :as str])
   (:use [cljd.test :only [deftest is testing are]]))
 
 (deftest testing-rseq
@@ -117,10 +119,10 @@
 (deftest testing-dart-new-dont-need-to-be-lifted
   (testing "dart/new can be inlined"
     (is (dart/is?
-          #dart [(dart:core/Symbol. "one") (dart:core/Symbol. "two") (dart:core/Symbol. "three")]
+          #dart ^Symbol [(dart:core/Symbol. "one") (dart:core/Symbol. "two") (dart:core/Symbol. "three")]
           #/(List Symbol)))
     (is (dart/is?
-          #dart [(dart:core/Symbol. "one") (dart:core/Symbol. (let [a "a" b "b"] (str a b)))]
+          #dart ^Symbol [(dart:core/Symbol. "one") (dart:core/Symbol. (let [a "a" b "b"] (str a b)))]
           #/(List Symbol)))))
 
 (def baptiste {:first-name "Baptiste" :last-name "Dupuch"})
@@ -253,14 +255,14 @@
           (subvec 1 3)))))
 
 (deftest testing-dart-map-comply-with-iseqable-ilookup
-  (let [dart-map (Map/fromEntries (. (seq {:a :b }) #/(cast MapEntry)))]
+  (let [dart-map (Map/fromEntries (. ^List (seq {:a :b }) #/(cast MapEntry)))]
     (is (= :b (get dart-map :a)))
     (is (true? (contains? dart-map :a)))
     (is (false? (contains? dart-map :e)))
     (is (= {:a :b} (into {} dart-map)))))
 
 (deftest testing-dart-mapentry-comply-with-imapentry-iidexed
-  (let [dart-map (Map/fromEntries (. (seq {:a :b }) #/(cast MapEntry)))
+  (let [dart-map (Map/fromEntries (. ^List (seq {:a :b }) #/(cast MapEntry)))
         me (first dart-map)]
     (is (= :a (nth me 0)))
     (is (= :b (nth me 1)))
@@ -283,7 +285,7 @@
     (is (true? (dart/is? (find (. [0 1 2] #/(cast int)) 1) #/(cljd.core/PersistentMapEntry int int))))
 
     (is (false? (dart/is? (find (subvec [0 1 2] 1) 1) #/(cljd.core/PersistentMapEntry int int))))
-    (is (true? (dart/is? (find (. (subvec [0 1 2] 1) #/(cast int)) 1) #/(cljd.core/PersistentMapEntry int int))))
+    (is (true? (dart/is? (find (. ^List (subvec [0 1 2] 1) #/(cast int)) 1) #/(cljd.core/PersistentMapEntry int int))))
 
     (is (false? (dart/is? (find {"a" "b"} "a") #/(cljd.core/PersistentMapEntry String String))))
     (is (true? (dart/is? (find (. {"a" "b"} #/(cast String String)) "a") #/(cljd.core/PersistentMapEntry String String))))))
@@ -301,3 +303,315 @@
     (is (not (identical? va vb)))
     (is (.== sa sb))
     (is (not (identical? sa sb)))))
+
+(deftest vars-dont-shadow-aliases
+  (is (= "ab" (str/join ["a" "b"])))
+  (is (= "1" (str 1))))
+
+(deftest closed-overs-hinted-arguments
+  ; https://clojurians.slack.com/archives/C03A6GE8D32/p1651592868443379
+  (let [f (fn [^String oops] (reify Object (toString [this] oops)))]
+    (is (= "abc" (str (f "abc"))))))
+
+(deftest named-const-constructors-GH53
+  (is (not (identical? ^:unique (Iterable/empty) (Iterable/empty))))
+  (is (identical? (Iterable/empty) (Iterable/empty))))
+
+(deftest parent-this-capture
+  (let [x (reify Object
+            (toString [outer-this]
+              (str "+" (reify Object
+                         (toString [inner-this]
+                           (str (.-hashCode outer-this)))))))]
+    (is (= (str "+" (.-hashCode x)) (.toString x)))))
+
+(deftest super-pseudo-type
+  (let [x (reify Object
+            (hashCode [_] 42)
+            (toString [self] (str (.-hashCode ^super self))))]
+    (is (= (str (dart:core/identityHashCode x)) (str x)))
+    (is (= 42 (.-hashCode x)))))
+
+
+(deftest closing-over-super
+  (let [v (volatile! nil)
+        x (reify Object
+            (hashCode [this]
+              (vreset! v #(.-hashCode ^super this))
+              42))
+        y (reify Object
+            (hashCode [that]
+              (vreset! v
+                (reify Object
+                  (hashCode [this]
+                    (bit-xor (.-hashCode ^super that) (.-hashCode ^super this)))))
+              43))]
+    (is (= 42 (.-hashCode x)))
+    (is (= (dart:core/identityHashCode x) (@v)))
+    (is (= 43 (.-hashCode y)))
+    (is (= (bit-xor (dart:core/identityHashCode y)
+             (dart:core/identityHashCode @v))
+          (.-hashCode @v)))))
+
+(deftype InferredAwait [^#/(Future int) prop]
+  (coucou [this] (await prop)))
+
+(deftype NotInferredAwait [^#/(Future int) prop]
+  (^:async coucou [this] (await prop)))
+
+(definterface ConcreteInterface (^#/(Future int) mymethod []))
+
+(deftype Concrete []
+  ConcreteInterface
+  (mymethod [this] (await (Future/value 42))))
+
+(deftest await-inference
+  (let [num (.value #/(Future int) 42)]
+    (is (= (await (.coucou (InferredAwait. num)))
+          (await (.coucou (NotInferredAwait. num)))))
+    (is (= (inc (await (.coucou (InferredAwait. num))))
+          (await ((fn [& more] (inc (await (first more)))) num))
+          43))
+    (is (= 42 (.-hashCode (reify Object
+                           (hashCode [this] ((fn ([] 42) ([one] (await one)))))))))
+    (is (= 42 (let [x (await (.mymethod (Concrete.)))] x)))))
+
+;; this case happened with dev.ServiceExtensionResponse/result
+(deftest infer-named-constructor-when-same-name-prop-exists
+  (let [ser (dev.ServiceExtensionResponse/result "coucou")]
+    (is (dart/is? ser dev/ServiceExtensionResponse))
+    (is (dart/is? (.-result ser) String?))))
+
+(definterface INullableFunctionBug
+  (^String text [^^{:params-types (void)} Function? onPressed]))
+
+(deftype NullableFunctionBug []
+  INullableFunctionBug
+  (text [this ^^{:params-types (void)} Function? onPressed]
+    (if-not (nil? onPressed)
+      (do (onPressed)
+          "hooo")
+      "Heeyyy")))
+
+(deftest nullable-function-bug
+  (let [x (NullableFunctionBug.)]
+    (fn [] "aa" nil)
+    (is (= "Heeyyy" (.text x nil)))
+    (is (= "hooo" (.text x (fn [] "dd" nil))))))
+
+(deftest CLJD-74-assoc!-subnode
+  (let [m '{tiltontec.util.base/*trdeep* 5 tiltontec.cell.base/*call-stack* 7}
+        m' (persistent! (assoc! (transient m) 'tiltontec.util.base/*trdeep* 50))]
+    (is (= (count m) (count m')))))
+
+(deftest CLJD-77-first-on-subvec
+  (let [v (into [] (range 100))]
+    (is (= 1 (first (subvec v 1))))))
+
+(deftest CLJD-76-case-on-symbols
+  (is (= true (case 'x x true false)))
+  (is (= false (case 'y x true false))))
+
+(definterface ICastNullable
+  (^String text [^#/(List? String) actions]))
+
+(deftype CastNullable [useless]
+  ICastNullable
+  (text [this actions]
+    (if-not (nil? actions)
+      (.-last actions)
+      "worked")))
+
+(deftest cast-nullable-to-non-nullable-for-castable-collections
+  (let [x (CastNullable. nil)]
+    (is (= "clojuredart" (.text x (cond-> ["coucou"]
+                                    true (conj "clojuredart")))))
+    (is (= "worked" (.text x nil)))
+    (is (= "worked" (.text x ^List? (identity nil))))))
+
+(deftest no-core-private-lib-exposed-by-compilation
+  ; it's a compile time "test": if it compiles it's ok
+  (let [s (fn []
+            (let [server (await (.bind io/HttpServer (.-anyIPv6 io/InternetAddress) 8080))]
+              (.forEach server (fn [^io/HttpRequest r]
+                                 (.close (.-response r))
+                                 nil))))]
+    ;; here we only test compilation works
+    (is (some? s))))
+
+(deftest CLJD-101-cast-them-all
+  (let [path ["first" "second"]]
+    (is (some?
+          (Uri.
+            .path (when (string? path) path)
+            .pathSegments (when (coll? path) path))))))
+
+(deftest dart-apply
+  (is (false?
+        (Function/apply dart:core/identical ["hello" "world"] {}))))
+
+(deftest CLJD-96-destructure-test
+  (let [sample-destructure-test (fn [& {:keys [foo]}] foo)]
+    (testing "Destructuring in many ways"
+      (is (nil? (sample-destructure-test)))
+      (is (zero? (sample-destructure-test :foo 0)))
+      (is (zero? (sample-destructure-test :foo 1 :foo 0)))
+      (is (nil? (sample-destructure-test :bar 1))))))
+
+(deftest casting-to-double
+  (is (= 1.0 (first #dart ^double [1.0])))
+  (is (= 1.0 (first #dart ^double [1])))
+  (is (= 1.0 (first #dart ^double [(identity 1)]))))
+
+;; see https://github.com/Tensegritics/ClojureDart/issues/112
+(definterface IIssue112
+  (^String? positionalopts [^String one ... ^int? two ^^{:params-types (String String String)} Function? three])
+  (^String? namedopts [^String one .& ^int? two ^^{:params-types (String String String)} Function? three]))
+
+(deftype ConcreteIssue112 []
+  IIssue112
+  (positionalopts [this one ... two three] (when three (three "one" "two")))
+  (namedopts [this one .& two three] (when three (three "one" "two"))))
+
+(deftest opt-named-pos-param-type-inference-github-11
+  (let [rei (reify :no-meta true
+              IIssue112
+              (positionalopts [this one ... two three] (when three (three "one" "two")))
+              (namedopts [this one .& two three] (when three (three "one" "two"))))
+        concrete (ConcreteIssue112)]
+    (is (= "onetwo" (.positionalopts rei "one" 2 (fn [a b] (str a b)))))
+    (is (= "onetwo" (.namedopts rei "one" .three (fn [a b] (str a b)))))
+    (is (= "onetwo" (.positionalopts concrete "one" 2 (fn [a b] (str a b)))))
+    (is (= "onetwo" (.namedopts concrete "one" .three (fn [a b] (str a b)))))))
+
+(deftest close-over-values-not-slots
+  (let [fs (loop [fs [] i 4]
+             (if (neg? i)
+               fs
+               (recur (conj fs (fn [] i)) (dec i))))]
+    (is (= [4 3 2 1 0] (map (fn [f] (f)) fs)))))
+
+(deftest resulting-type-arg-nullable-iff-input-type-arg-nullable-and-param-null
+  (let [m {"color" "red"}
+        m (. m #/(cast String String?))]
+    (is (= true (dart/is? m #/(Map String String?))))))
+
+(deftest seq?-nil-is-false-CLJD137
+  (is (= false (seq? nil))))
+
+(defrecord RecordWithMungedFields [to-test!])
+
+(deftest records-equiv-work-with-munged-fields-CLJD135
+  (is (= (->RecordWithMungedFields 42) (->RecordWithMungedFields 42)))
+  (is (not= (->RecordWithMungedFields 42) (->RecordWithMungedFields 33))))
+
+(deftest lifted-letfn-CLJD141
+  (is (= 2 (apply (letfn [(f [x] (inc x))] f) 1 nil)))
+  (is (= [:f :g :f :g]
+        (letfn [(g [n] (when (pos? n) (cons :g (f (dec n)))))
+                (f [n] (when (pos? n) (cons :f (g (dec n)))))]
+          ((identity f) 4)))))
+
+(deftest toDoublePushedToLeaves-CLJD142
+  (is (= 0 (identity ^double (if (< 1 2) 0 0))))
+  (is (nil? (identity ^double? (if (< 1 2) nil 0)))))
+
+(deftype Const1 [])
+(deftype Const2 [] :extends Const1)
+
+(deftest properly-infer-const-when-ancestor-is-not-Object
+  (is (identical? (Const2) (Const2))))
+
+(deftype Const3 [x])
+
+(deftest const-locals-inference-CLJD145
+  (let [s "coucou"]
+    (is (identical? (Const3 s) (Const3 "coucou")))
+    (is (identical? (Const3 s) (Const3 s)))))
+
+(deftest stream-xform-tests
+  (let [coll (range 10)
+        xform (comp (map inc) (filter odd?) (halt-when #(< 7 %)))
+        error-xform (map (fn [[er st]]
+                           [(ArgumentError "bordeaux is magic")
+                            (StackTrace/fromString "stacktrace")]))]
+    (is (dart/is? (stream coll) dart:core/Stream))
+    (is (= (into [] (-> (stream xform coll) .toList await)) [1 3 5 7]))
+    (is (= (into [] (-> (stream xform error-xform coll) .toList await)) [1 3 5 7]))
+    (is (thrown? ArgumentError (-> (stream xform error-xform (Stream/error :error)) .toList await)))
+    (is (thrown-with-msg?
+          ArgumentError
+          #"bordeaux is magic"
+          (-> (stream xform error-xform (Stream/error :error)) .toList await)))
+    (is (= (into [] (-> (stream xform (map first) :as-values (Stream/error :error)) .toList await))
+          [:error]))))
+
+;; (.fold (stream xform coll) [] (fn [acc item] (conj acc item)))
+
+(deftest meta-on-colls-not-generated-CLJD151
+  (is (= (meta '^{x (inc 1)} [1]) '{x (inc 1)}))
+  (is (= ((fn [] (meta '^{x (inc 1)} [1]))) '{x (inc 1)}))
+  (is (= (meta ^{:a (inc 1)} [1]) {:a 2}))
+  (is (= ((fn [] (meta ^{:a (inc 1)} [1]))) {:a 2}))
+
+  (is (= (meta '^{x (inc 1)} []) '{x (inc 1)}))
+  (is (= ((fn [] (meta '^{x (inc 1)} []))) '{x (inc 1)}))
+  (is (= (meta ^{:a (inc 1)} []) {:a 2}))
+  (is (= ((fn [] (meta ^{:a (inc 1)} []))) {:a 2})))
+
+(defprotocol IDestructuringProto
+  (-destructured [a b]))
+
+(defprotocol IDestructuringProto2
+  (-destructured2 [a b]))
+
+(defprotocol IDestructuringProto3
+  (-destructured3 [a b]))
+
+(defprotocol INotDestructuringProto
+  (-not-destructured [a b]))
+
+(definterface INotDestructuringInterfaceWithOpts
+  (^num notdestructured [one ... ^int? two]))
+
+(deftype DestructuringProto []
+  INotDestructuringInterfaceWithOpts
+  (^num notdestructured [this {:keys [a b]} ... ^num? two] (+ two a b))
+  IDestructuringProto
+  (-destructured [_ {:keys [a b c]}] [a b c]))
+
+(extend-type DestructuringProto
+  IDestructuringProto2
+  (-destructured2 [_ {:strs [a b c]}] [a b c])
+  INotDestructuringProto
+  (-not-destructured [a b] b))
+
+(extend-protocol IDestructuringProto3
+  DestructuringProto
+  (-destructured3 [_ {:syms [a b c]}] [a b c]))
+
+(deftest destructuring-for-deftype
+  (is (= 6 (.notdestructured (DestructuringProto.) {:a 1 :b 2 :c 3} 3)))
+  (is (= [1 2 3] (-destructured (DestructuringProto.) {:a 1 :b 2 :c 3})))
+  (is (= [1 2 3] (-destructured2 (DestructuringProto.) {"a" 1 "b" 2 "c" 3})))
+  (is (= [1 2 3] (-destructured3 (DestructuringProto.) '{a 1 b 2 c 3})))
+  (is (= {:a 1 :b 2 :c 3} (-not-destructured (DestructuringProto.) {:a 1 :b 2 :c 3}))))
+
+(deftest test-abs
+  (are [in ex] (= ex (abs in))
+    -1 1
+    1 1
+    #_#_Long/MIN_VALUE Long/MIN_VALUE ;; special case!
+    -1.0 1.0
+    -0.0 0.0
+    #_#_##-Inf ##Inf
+    #_#_##Inf ##Inf
+    -123.456M 123.456M
+    -123N 123N
+    -1/5 1/5)
+  #_(is (NaN? (abs ##NaN))))
+
+(deftest closed-over-consts-in-reify
+  (let [s "name"
+        f (fn ([] (Symbol s)) ([_] nil))]
+    (is (identical? (Symbol s) (f)))))

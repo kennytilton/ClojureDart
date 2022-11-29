@@ -1,0 +1,30 @@
+(ns sample.snackbar
+  "Faithful port of https://docs.flutter.dev/cookbook/design/snackbars"
+  (:require
+   ["package:flutter/material.dart" :as m]
+   [cljd.flutter.alpha2 :as f]))
+
+(def snackbar
+  (m/SnackBar
+   .content (m/Text "Yay! A SnackBar!")
+   .action
+   (m/SnackBarAction .label "Undo" .onPressed (fn []))))
+
+(def snackbar-demo
+  (f/widget
+   :get [m/ScaffoldMessenger]
+   m/Center
+   (m/ElevatedButton
+     .onPressed (fn []
+                  (.showSnackBar scaffold-messenger snackbar)
+                  nil))
+   (m/Text "Show text")))
+
+(defn main []
+  (let [title "Snackbar Demo"]
+    (m/runApp
+     (m/MaterialApp
+      .title title
+      .home (m/Scaffold
+             .appBar (m/AppBar .title (m/Text title))
+             .body snackbar-demo)))))

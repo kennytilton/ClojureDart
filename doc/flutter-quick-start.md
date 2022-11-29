@@ -21,39 +21,24 @@ Creates a directory for the project with the following deps.edn:
 ``` shell
 mkdir hello
 cd hello
-```
-
-If your GitHub account is [configured for SSH access](https://docs.github.com/en/github/authenticating-to-github/connecting-to-github-with-ssh/adding-a-new-ssh-key-to-your-github-account):
-
-``` shell
 cat << EOF > deps.edn
 {:paths ["src"] ; where your cljd files are
- :deps {org.clojure/clojure {:mvn/version "1.10.1"}
-        tensegritics/clojuredart
-        {:git/url "git@github.com:tensegritics/ClojureDart.git"
-         :sha "e987d563c7d249dfa5372f4f1f433acd1acd3e3c"}}}
-EOF
-```
-
-Otherwise using HTTPS authentication:
-
-``` shell
-cat << EOF > deps.edn
-{:paths ["src"] ; where your cljd files are
- :deps {org.clojure/clojure {:mvn/version "1.10.1"}
-        tensegritics/clojuredart
+ :deps {tensegritics/clojuredart
         {:git/url "https://github.com/tensegritics/ClojureDart.git"
-         :sha "e987d563c7d249dfa5372f4f1f433acd1acd3e3c"}}}
+         :sha "1c519109b5dda0c24badc7bea3b89b52f3d3db8f"}}
+ :aliases {:cljd {:main-opts ["-m" "cljd.build"]}}
+ :cljd/opts {:kind :flutter
+             :main acme.main}}
 EOF
 ```
+
+`acme.main` is the root namespace of the project where the `main` function is defined.
 
 ## 4. Initialize the project
 
 ``` shell
-clj -M -m cljd.build init acme.main
+clj -M:cljd init
 ```
-
-`acme.main` is the root namespace of the project where the `main` function is defined.
 
 ## 5. Create a ClojureDart file with a main entry-point
 
@@ -63,24 +48,21 @@ First create a directory where clojure files live
 mkdir -p src/acme
 cat << EOF > src/acme/main.cljd
 (ns acme.main
-  ;; pure dart package are imported using string
-  (:require ["package:flutter/material.dart" :as material]
-            ["package:flutter/widgets.dart" :as widgets]
-            ["package:flutter/painting.dart" :as painting]))
+  (:require ["package:flutter/material.dart" :as m]))
 
 (defn main []
-  (material/runApp
-    (material/MaterialApp.
-      :title "Welcome to Flutter"
-      :theme (material/ThemeData. :primarySwatch material.Colors/pink)
-      :home (material/Scaffold.
-              :appBar (material/AppBar.
-                        :title (widgets/Text. "Welcome to ClojureDart"))
-              :body (widgets/Center.
-                      :child (widgets/Text. "This text is Centered."
-                               :style (painting/TextStyle.
-                                        :color material.Colors/red
-                                        :fontSize 32.0)))))))
+  (m/runApp
+    (m/MaterialApp
+      .title "Welcome to Flutter"
+      .theme (m/ThemeData .primarySwatch m/Colors.pink)
+      .home (m/Scaffold
+              .appBar (m/AppBar
+                        .title (m/Text "Welcome to ClojureDart"))
+              .body (m/Center
+                      .child (m/Text "This text is Centered."
+                               .style (m/TextStyle
+                                        .color m.Colors/red
+                                        .fontSize 32.0)))))))
 EOF
 ```
 ## 7. Start a simulator
@@ -94,10 +76,28 @@ open -a Simulator
 
 Android:
 
+> :bulb: We recommand you to use Genymotion plugin for Android Studio, since its lighter than the AS native one.
+
+Please follow [those guidelines](https://docs.genymotion.com/desktop/Get_started/Requirements/) to install and setup Genymotion.
+
+
+* Configure the SDK **within Genymotion** (`Genymotion > Preferences > ADB > Use custom Android SDK tools`) then use the path `/$HOME/Android/sdk` (default location after installing Android Studio)
+
+    * Create a new device within Genymotion
+
+* In **Android Studio**
+
+    * `Select Tools > SDK Manager > Plugins > Genymotion`, and restart Android Studio
+    * Then, select `Files > Settings`
+    * On the sidebar, select `Tools > Genymotion plugin`
+    * Select the path to your Genymotion folder
+
+* within your **flutter project**, run `flutter devices`: Genymotion should appear among connected devices. (make sure your genymotion device is still on)
+
 ## 8. Start the ClojureDart watcher
 
 ``` shell
-clj -M -m cljd.build flutter
+clj -M:cljd flutter
 ```
 
 ## 9. Enjoy!

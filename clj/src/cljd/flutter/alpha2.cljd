@@ -1,0 +1,541 @@
+(ns cljd.flutter.alpha2
+  (:require ["package:flutter/widgets.dart" :as widgets]
+            ["package:flutter/foundation.dart" :as foundation]
+            ["dart:async" :as dart:async]
+            [cljd.string :as str])
+  (:host-ns
+   (:require [clojure.string :as str])))
+
+(defprotocol Subscribable
+  (-subscribe [x f! opts]
+    "Subscribe to updates on x.
+     opts is a map of keyword-keyed options
+     (keywords must be namespaced except for :default)
+     f! is a side-effecting function of one argument.
+     Returns a subscription.
+     MUST call f! during subscription.")
+  (-unsubscribe [x sub] "Cancels the provided subscription."))
+
+(extend-protocol Subscribable
+  Null
+  (-subscribe [n f! opts] (f! (:default opts)) nil)
+  (-unsubscribe [n _] nil)
+  cljd.core/Atom
+  (-subscribe [a f _]
+    (let [cb (fn [_ _ _ new-state] (f new-state))]
+      (f @a)
+      (add-watch a cb cb)
+      cb))
+  (-unsubscribe [a cb]
+    (remove-watch a cb))
+  Stream
+  (-subscribe [s f opts]
+    (f (:default opts))
+    (.listen s (fn [x] (f x) nil) .cancelOnError true))
+  (-unsubscribe [s sub]
+    (.cancel ^dart:async/StreamSubscription sub))
+  Future
+  (-subscribe [future f opts]
+    (let [sub (volatile! true)
+          {:keys [default :future/on-error]} opts]
+      (f default)
+      (.then future
+        #(when @sub (f %))
+        .onError
+        (when on-error
+          (fn [e ... st]
+            (when @sub
+              (let [v (await (on-error default e st))]
+                (when-not (identical? v default) (f v)))))))
+      sub))
+  (-unsubscribe [s sub]
+    (vreset! sub false))
+  ; TODO & check if we handle partial order on protocols dispatch
+  foundation/ValueListenable
+  (-subscribe [vl f _]
+    (f (.-value vl))
+    (doto #(f (.-value vl))
+      (->> (.addListener vl))))
+  (-unsubscribe [vl listener]
+    (.removeListener vl listener))
+  foundation/Listenable
+  (-subscribe [l f opts]
+    (f true)
+    (doto #(f true)
+      (->> (.addListener l))))
+  (-unsubscribe [l listener]
+    (.removeListener l listener)))
+
+(defprotocol StateLifecycle
+  (-build [_ state ctx])
+  (-update-state [_ state])
+  (-init-state [_ state])
+  (-dispose-state [_ state]))
+
+(defn sub
+  "Returns a subscribable view on another subscribable.
+   Values are the result of (apply f v args) for all values v yielded by the
+   upstream subscribable.
+   This subscribable generates events only when the resulting value changes."
+  [s f & args]
+  (reify
+    Subscribable
+    (-subscribe [self f! opts]
+      (let [v (volatile! nil)]
+        (vreset! v v)
+        (-subscribe s
+          (fn [x]
+            (let [x (apply f x args)]
+              (when (not= x @v)
+                (vreset! v x)
+                (f! x))))
+          opts)))
+    (-unsubscribe [self sub]
+      (-unsubscribe s sub))))
+
+(deftype InheritedBindings [bindings child]
+  :extends (widgets/InheritedModel .child child)
+  (isSupportedAspect [this name] true)
+  (updateShouldNotify [this prev-this]
+    (not= bindings (.-bindings ^InheritedBindings prev-this)))
+  (updateShouldNotifyDependent [this prev-this aspects]
+    (let [prev-bindings (.-bindings ^InheritedBindings prev-this)]
+      (boolean
+        (some (fn [k] (not= (prev-bindings k) (bindings k)))
+          (first aspects))))))
+
+(defn- ^:macro-support collect-options
+  "Returns [options-map & more]."
+  [exprs supported-option?]
+  (let [opts (take-while (comp keyword? first) (partition 2 exprs))
+        exprs (drop (* 2 (count opts)) exprs)
+        opts (into {} (map vec) opts)]
+    (doseq [k (keys opts)]
+      (when-not (supported-option? k)
+        (throw (Exception. (str "Unsupported option: " k)))))
+    (cons opts exprs)))
+
+(defn- ^:macro-support camel-kebab [s]
+  (str/replace s #"(^[A-Z])|[A-Z]" (fn [[s start]] (cond->> (str/lower-case s) (not start) (str "-")))))
+
+(def ^:private ^:macro-support closest-context `^widgets/BuildContext context#)
+
+(deftype WatchState
+         [^:mutable k ^:mutable subscribable
+          ^:mutable subscription ^:mutable latest]
+  :extends widgets/State
+  (initState [state]
+    (.initState ^super state)
+    (-init-state (.-widget state) state)
+    nil)
+  (didUpdateWidget [state old-widget]
+    (.didUpdateWidget ^super state old-widget)
+    (-update-state (.-widget state) state)
+    nil)
+  (dispose [state]
+    (-dispose-state (.-widget state) state)
+    (.dispose ^super state))
+  (build [state ctx]
+    (-build (.-widget state) state ctx))
+  cljd.core/IFn
+  (-invoke [state x] (set! latest x) (.setState state (fn []))))
+
+(defn ^:macro-support refresh-on-expr [opts &env expr]
+  (if (contains? opts :refresh-on)
+    (:refresh-on opts)
+    (let [closed-overs ((:closed-overs &env) expr)]
+      (if (next closed-overs)
+        (vec closed-overs)
+        ; works for 1 and 0 closed overs
+        (first closed-overs)))))
+
+(defn ^:macro-support expand-watch
+  [&env env binding expr {:keys [dispose] :as opts} forms]
+  (let [accessor (:> opts)
+        dispose (if (true? dispose) '.dispose dispose)
+        refresh-on (refresh-on-expr opts &env expr)
+        opts (dissoc opts :refresh-on :> :dispose)
+        state `state#
+        subscribable `subscribable#
+        subscribe-call
+        `(-subscribe ~subscribable
+                     ~(if accessor
+                        `(fn [_#]
+                           (~state (-> ~subscribable ~accessor)))
+                        state)
+                     ~opts)]
+    `(reify :extends (widgets/StatefulWidget .key ~(:key env))
+       :no-meta true
+       (~'createState [_#] (WatchState nil nil nil nil))
+       cljd.flutter.alpha2/StateLifecycle
+       (~'-init-state [_# state#]
+         (let [~state ^WatchState state#
+               ~subscribable ~expr]
+           (set! (.-k ~state) ~refresh-on)
+           (set! (.-subscribable ~state) ~subscribable)
+           (set! (.-subscription ~state) ~subscribe-call)))
+       (~'-dispose-state [_# state#]
+         (let [state# ^WatchState state#]
+           (doto (.-subscribable state#)
+             (-unsubscribe (.-subscription state#))
+             ~@(when dispose [`(-> (dart/type-like ~expr) ~dispose)]))
+           (set! (.-k state#) nil)
+           (set! (.-subscribable state#) nil)
+           (set! (.-subscription state#) nil)
+           (set! (.-latest state#) nil)))
+       (~'-build [_# state# ctx#]
+         (let [~binding (.-latest ^WatchState state#)
+               ~closest-context ctx#]
+           (-widget-cont ~(assoc env :key nil :closest-ctx true)
+             ~@forms)))
+       (~'-update-state [_# state#]
+         (let [~state ^WatchState state#
+               k# ~refresh-on]
+           (when-not (= k# (.-k ~state))
+             (doto (.-subscribable ~state)
+               (-unsubscribe (.-subscription ~state))
+               ~@(when dispose [`(-> (dart/type-like ~expr) ~dispose)]))
+             (let [~subscribable ~expr]
+               (set! (.-k ~state) k#)
+               (set! (.-subscribable ~state) ~subscribable)
+               (set! (.-subscription ~state) ~subscribe-call))))))))
+
+(defn ^:macro-support expand-bg-watcher
+  [&env env binding expr {:keys [dispose] :as opts} body forms]
+  (let [accessor (:> opts)
+        dispose (if (true? dispose) '.dispose dispose)
+        refresh-on (refresh-on-expr opts &env expr)
+        opts (dissoc opts :refresh-on :> :dispose)
+        state `state#
+        subscribable `subscribable#
+        subscribe-call
+        `(-subscribe ~subscribable
+                     ~(if accessor
+                        `(fn [_#]
+                           (let [x# (-> ~subscribable ~accessor)]
+                             (when-not (identical? x# ~state)
+                               (let [~binding x#]
+                                 ~@body
+                                 nil))))
+                        `(fn [x#]
+                           (when-not (identical? x# ~state)
+                             (let [~binding x#]
+                               ~@body
+                               nil))))
+                     ~(assoc opts :default state))]
+    `(reify :extends (widgets/StatefulWidget .key ~(:key env))
+       :no-meta true
+       (~'createState [_#] (WatchState nil nil nil nil))
+       cljd.flutter.alpha2/StateLifecycle
+       (~'-init-state [_# state#]
+         (let [~state ^WatchState state#
+               ~subscribable ~expr]
+           (set! (.-k ~state) ~refresh-on)
+           (set! (.-subscribable ~state) ~subscribable)
+           (dart:async/scheduleMicrotask (fn [] (set! (.-subscription ~state) ~subscribe-call)))))
+       (~'-dispose-state [_# state#]
+         (let [state# ^WatchState state#]
+           (doto (.-subscribable state#)
+             (-unsubscribe (.-subscription state#))
+             ~@(when dispose [`(-> (dart/type-like ~expr) ~dispose)]))
+           (set! (.-k state#) nil)
+           (set! (.-subscribable state#) nil)
+           (set! (.-subscription state#) nil)))
+       (~'-build [_# state# ctx#]
+         (let [~closest-context ctx#]
+           (-widget-cont ~(assoc env :key nil :closest-ctx true)
+                         ~@forms)))
+       (~'-update-state [_# state#]
+         (let [~state ^WatchState state#
+               k# ~refresh-on]
+           (when-not (= k# (.-k ~state))
+             (doto (.-subscribable ~state)
+               (-unsubscribe (.-subscription ~state))
+               ~@(when dispose [`(-> (dart/type-like ~expr) ~dispose)]))
+             (let [~subscribable ~expr]
+               (set! (.-k ~state) k#)
+               (set! (.-subscribable ~state) ~subscribable)
+               (dart:async/scheduleMicrotask (fn [] (set! (.-subscription ~state) ~subscribe-call))))))))))
+
+(deftype ResourceState [^:mutable k ^:mutable resource]
+  :extends widgets/State
+  (initState [state]
+    (.initState ^super state)
+    (-init-state (.-widget state) state)
+    nil)
+  (didUpdateWidget [state old-widget]
+    (.didUpdateWidget ^super state old-widget)
+    (-update-state (.-widget state) state)
+    nil)
+  (dispose [state]
+    (-dispose-state (.-widget state) state)
+    (.dispose ^super state))
+  (build [state ctx]
+    (-build (.-widget state) state ctx)))
+
+(defn ^:macro-support expand-resource
+  [&env env binding expr opts forms]
+  (let [dispose (:dispose opts '.dispose)
+        refresh-on (refresh-on-expr opts &env expr)]
+    `(reify :extends (widgets/StatefulWidget .key ~(:key env))
+       :no-meta true
+       (~'createState [_#] (ResourceState nil nil))
+       cljd.flutter.alpha2/StateLifecycle
+       (~'-init-state [_# state#]
+         (let [state# ^ResourceState state#]
+           (set! (.-k state#) ~refresh-on)
+           (set! (.-resource state#) ~expr)))
+       (~'-dispose-state [_# ^ResourceState state#]
+         (let [state# ^ResourceState state#]
+           (set! (.-k state#) nil)
+           (-> (dart/type-like (.-resource state#) ~expr) ~dispose)
+           (set! (.-resource state#) nil)))
+       (~'-build [_# ^ResourceState state# ^widgets/BuildContext ctx#]
+         (let [~binding (dart/type-like (.-resource ^ResourceState state#) ~expr)]
+           (-widget-cont ~(assoc env :key nil :closest-ctx true)
+                         ~@forms)))
+       (~'-update-state [_# state#]
+         (let [state# ^ResourceState state#
+               k# ~refresh-on]
+           (when-not (= k# (.-k state#))
+             (-> (dart/type-like (.-resource state#) ~expr) ~dispose)
+             (set! (.-k state#) k#)
+             (set! (.-resource state#) ~expr)))))))
+
+(defn ^:macro-support expand-get-inherited [env v forms]
+  (if-not (:closest-ctx env)
+    `(-widget-cont ~env :context ~closest-context :get ~v ~@forms)
+    (let [inherit (if (vector? v) {:value-of v} v)
+          inherit (if-some [shortcuts (:value-of inherit)]
+                    (into (dissoc inherit :value-of)
+                          (map (fn [type-or-kw]
+                                 (let [hint (cond-> type-or-kw (seq? type-or-kw) first)]
+                                   [(symbol
+                                     (if (keyword? hint)
+                                       (name hint)
+                                       (camel-kebab (re-find #"[^.]+$" (name hint)))))
+                                    type-or-kw])))
+                          shortcuts)
+                    inherit)
+          inherit (into inherit
+                        (keep (fn [[k v]] (when-not (seq? v) [k (list v)])))
+                        inherit)
+          bindings-sym `bindings#
+          {inherited-widgets false
+           inherited-bindings true}
+          (group-by (fn [[sym [type-or-kw]]] (keyword? type-or-kw)) inherit)]
+      `(let [~@(mapcat (fn [[sym [type-or-kw & args]]]
+                         [sym
+                          (list*
+                            (symbol
+                              (namespace type-or-kw)
+                              (str (name type-or-kw) ".of"))
+                            closest-context args)])
+                 inherited-widgets)]
+         (->> (-widget-cont ~env ~@forms)
+           ~@(when (seq inherited-bindings)
+               [`(let [inherited-elt# (#/(.getElementForInheritedWidgetOfExactType InheritedBindings) ~closest-context)
+                       ~bindings-sym (some-> inherited-elt#
+                                       ^InheritedBindings (.-widget)
+                                       .-bindings)
+                       ~@(mapcat
+                           (fn [[sym [type-or-kw & args]]]
+                             [sym
+                              `(->
+                                 (get ~bindings-sym ~type-or-kw)
+                                 ~(or (seq args) `do))])
+                           inherited-bindings)]
+                   (.dependOnInheritedElement ~closest-context
+                     inherited-elt#
+                     .aspect ~(into [] (map (fn [[sym [type-or-kw]]] type-or-kw)) inherited-bindings)))]))))))
+
+(defn ^:macro-support expand-bind [env bindings-map forms]
+  `(-widget-cont ~env
+     :context ctx#
+     :let [bindings# ~bindings-map
+           elt# (#/(.getElementForInheritedWidgetOfExactType InheritedBindings) ctx#)         prev-bindings# (some-> elt# ^InheritedBindings (.-widget) .-bindings)
+           non-shadowed-keys#
+           (remove (fn [k#] (contains? bindings# k#)) (keys prev-bindings#))
+           _ (when (seq non-shadowed-keys#)
+               (.dependOnInheritedElement ctx# elt# .aspect non-shadowed-keys#))]
+     (cljd.flutter.alpha2/InheritedBindings. (merge prev-bindings# bindings#)
+       (-widget-cont ~(assoc env :key nil :closest-ctx true) ~@forms))))
+
+(defn ^:macro-support expand-vsync [env name forms]
+  `(reify :extends (widgets/StatefulWidget .key ~(:env key))
+     :no-meta true
+     (~'createState [_#]
+       (reify :extends widgets/State
+         :no-meta true
+         (~'build [state# ~closest-context]
+           (let [~name state#]
+             (-widget-cont ~(assoc env :key nil :closest-ctx true) ~@forms)))
+         ^:mixin widgets/TickerProviderStateMixin))))
+
+(deftype SpyWidget [k child f]
+  :extends (widgets/StatelessWidget .key k)
+  (build [_ _] child)
+  (debugFillProperties [this props-builder]
+   (.debugFillProperties ^super this props-builder)
+   (f props-builder)
+   nil))
+
+(defn ^:macro-support expand-spy [env expr forms]
+  `(SpyWidget ~(:key env) (-widget-cont ~(assoc env :key nil) ~@forms)
+     (fn [^foundation/DiagnosticPropertiesBuilder props-builder#]
+       (.add props-builder# (foundation/DiagnosticsNode.message (.toString ~expr))))))
+
+(defmacro widget
+  "Returns a widget.
+   The body is made of forms, dotted parameter names and directives.
+   A directive is a keyword followed by a form.
+   The following directives are supported:
+   :key, :let, :get, :bind, :vsync, :managed, :watch, :bg-watcher, :spy and :context.
+   Forms and directives are threaded (a bit like with ->>) to nest them.
+   The outermost form comes first.
+   For example:
+   (widget m/Center ...) expands to (m/Center .child (widget ...))
+   (widget (m/Center .widthFactor 1.1)  ...) expands
+   to (m/Center .widthFactor 1.1 .child (widget ...))
+   .child threading is the default may you can opt to choose another param name:
+   (widget (m/Scaffold .appBar (m/AppBar)) .body ...) expands
+   to (m/Scaffold .appBar (m/AppBar) .body (widget ...))
+   Directives:
+   :key k -- use k (a regular value, nil even!) as the key for this widget.
+     It's important to put a key on widgets when they can be reordered and/or the
+     siblings count is not set.
+   :let [bindings] -- just a regular let, all bindings are visible to the next
+     forms.
+   :get [SomeClass1 ... SomeClass2]
+     -- shortcut for :get {:value-of [SomeClass1 ... SomeClass2]}
+   :get {a AClass b :some/name :value-of [AnotherClass]} -- introduces a, b and
+     another-class (kebab-cased version of AnotherClass) in the local scope for
+     next forms. a and b may be destructuring forms.
+     They are bound to:
+     - for classes (eg AClass and AnotherClass) to the value returned by
+       their static .of method.
+       For example :get [m/Theme] binds theme to (m/Theme.of ctx).
+     - for keywords to the value set by the closest matching :bind directive in
+       the widget's ancestors.
+     Last, when .of expects more arguments (eg Localizations) then you can pass
+     these argument by by using (ClassName a b c) instead of just ClassName.
+   :bind {:some/name value} -- makes value available to :get {x :some/name} on
+     all descendants.
+   :vsync name -- bind name to a TicketProvider suitable for animation.
+   :managed [bindings] -- evaluate bindings as per let but with a twist.
+     The twist is that each \"binding expr\" pair can be followed by options pairs \":keyword expr\".
+     Under :managed each value is going to be managed (that is its lifecycle will
+     be tied to the widget) and will be disposed in due time by a call to
+     its .dispose method.
+     Supported options are :refresh-on and :dispose.
+     - :dispose form -- specify another method to use (eg .close or .cancel)
+       to properly dispose the managed resource. If arguments are required for this
+       method or function you may provide a list like (.meth a b) and it will
+       expand to (.meth resource a b).
+     - :refresh-on expr -- the managed resource will be cycled (disposed and
+       recreated) each time expr evaluates to a new value.
+       Default behavior is to refresh-on on all locals (free variables) used by
+       found in expr.
+       Use `:refresh-on :never` to avoid refreshing (or any other constant
+       instead of :never).
+   :watch [bindings] -- for each \"binding expr\" pair, subscribe to expr and
+     use binding to bind each value received under the subscription. Each change
+     triggers a rebuild.
+     Any object to which the Subscribable protocol has been extended can be watched.
+     Out of the box it means: atoms, Streams, Futures, Listenables,
+     ValueListenable and... nil.
+     These bindings can take options (in the same way as :managed bindings do).
+     Supported options are  :refresh-on, :dispose and :>
+     - :refresh-on expr -- see :managed
+     - :dispose form -- if the object under watch also needs to be managed use
+       this option. Works like :dispose for :managed except for \":dispose true\"
+       which is a shortcut for \":dispose .dispose\".
+     - :> form -- this one is meant to be used with Listenable instances because
+       they don't produce values, just a change notification. So if this option
+       is not used you only get trues from the subscription.
+       When this option is set then values are produced by evaluating
+       (-> subscribable form).
+   :bg-watcher ([binding expr & options] body) -- creates a background watcher on
+     expr (which must be subscribable, see :watch). Same options as :watch are
+     supported.
+     Main differences from :watch are:
+     - does not trigger rebuilds
+     - bindings are only visible in the body of the watcher, not to the rest of
+       the widget.
+   :spy expr -- make expr's value available into Flutter DevTools.
+   :context name -- bind name to the current BuildContext."
+  [& body]
+  `(-widget-cont {} ~@body))
+
+(defn- ^:macro-support stateless-flush [env forms]
+  `(reify :extends (widgets/StatelessWidget .key ~(:key env))
+     :no-meta true
+     (~'build [_# ~closest-context]
+      (-widget-cont ~(assoc env :key nil :closest-ctx true) ~@forms))))
+
+(defn- ^:macro-support expand-directive [&env env k v form & more-forms]
+  (let [ksym `k#
+        forms (cons form more-forms)]
+    (case k
+      :key `(let [~ksym (foundation/ValueKey ~v)]
+              (-widget-cont ~(assoc env :key ksym) ~@forms))
+      :let `(let ~v (-widget-cont ~env ~@forms))
+      :watch
+      (if-some [[binding expr & more] (seq v)]
+        (let [[opts & more] (collect-options more
+                                             #(or (qualified-keyword? %)
+                                                  (#{:default :refresh-on :dispose :>} %)))]
+          (expand-watch &env env binding expr opts (list* :watch more forms)))
+        `(-widget-cont ~env ~@forms))
+      :managed
+      (if-some [[binding expr & more] (seq v)]
+        (let [[opts & more] (collect-options more  #{:dispose :refresh-on})]
+          (expand-resource &env env binding expr opts (list* :managed more forms)))
+        `(-widget-cont ~env ~@forms))
+      :bg-watcher
+      (let [[[binding expr & more] & body] (seq v)
+            [opts & more] (collect-options more
+                            #(or (qualified-keyword? %)
+                               (#{:refresh-on :dispose :>} %)))]
+        (when more
+          (throw (Exception. "Extra forms found after options.")))
+        (expand-bg-watcher &env env binding expr opts body forms))
+      :bind (expand-bind env v forms)
+      :get (expand-get-inherited env v forms)
+      :context
+      (if (:closest-ctx env)
+        `(let [~v ~closest-context] (-widget-cont ~env ~@forms))
+        (stateless-flush env (list* :context v forms)))
+      :spy (expand-spy env v forms)
+      :vsync (expand-vsync env v forms))))
+
+(defmacro -widget-cont
+  "PRIVATE DONT USE"
+  [env form & more-forms]
+  (cond
+    (keyword? form) (apply expand-directive &env env form more-forms)
+    (:key env)
+    (stateless-flush env (cons form more-forms))
+    (nil? more-forms) form
+    (symbol? form)
+    `(-widget-cont ~env ~(with-meta (list form) (meta form)) ~@more-forms)
+    (seq? form)
+    (let [[maybe-prop & more-forms] more-forms
+          prop (when (and more-forms (simple-symbol? maybe-prop)
+                       (.startsWith (name maybe-prop) "."))
+                 maybe-prop)
+          env (dissoc env :closest-ctx)]
+      (-> (if prop
+            `(~@form ~prop (-widget-cont ~env ~@more-forms))
+            `(~@form .child (-widget-cont ~env ~maybe-prop ~@more-forms)))
+          (with-meta (meta form))))
+    :else (throw (ex-info (str "Unexpected widget form: " (pr-str form)) {:form form :more-forms more-forms}))))
+
+(defmacro build
+  "Generates a so-called \"builder\" function, that is a widget-returning function which expects 1+ arguments, where the first argument is a BuildContext. (Such fns are expected for example as the .itemBuilder param to ListView/builder)
+  `argsvec` is the argument vector, without the BuildContext. If argsvec is empty it can be omitted.
+  After the `argsvec` comes a body, interpreted as per the `widget` macro."
+  [argsvec? & body]
+  (if (vector? argsvec?)
+    `(fn [~closest-context ~@argsvec?] (-widget-cont {:closest-ctx true} ~@body))
+    `(fn [~closest-context] (-widget-cont {:closest-ctx true} ~argsvec? ~@body))))
