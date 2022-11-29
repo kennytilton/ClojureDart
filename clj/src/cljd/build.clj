@@ -215,7 +215,7 @@
                         compile-nses)
                   (when flutter-stdin
                     (locking flutter-stdin
-                      (doto flutter-stdin (.write "r") .flush))))))]
+                      (doto flutter-stdin (.write "R") .flush))))))]
         (compile-nses namespaces)
         (when (or watch flutter)
           (newline)
